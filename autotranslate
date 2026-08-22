@@ -1,0 +1,3272 @@
+const puppeteer = require("puppeteer");
+
+// ============================================================
+// CONFIG
+// ============================================================
+
+const CHANNEL_ID = "UC8MtpDCB6kSqqVk4UFMR7Pw";
+
+const CHANNEL_VIDEOS_URL =
+    `https://studio.youtube.com/channel/${CHANNEL_ID}/videos/upload`;
+
+const CHANNEL_SHORTS_URL =
+    `https://studio.youtube.com/channel/${CHANNEL_ID}/videos/short`;
+
+const CHANNEL_LIVE_URL =
+    `https://studio.youtube.com/channel/${CHANNEL_ID}/videos/live`;
+
+function translationsUrl(videoId) {
+    return `https://studio.youtube.com/video/${videoId}/translations?c=${CHANNEL_ID}`;
+}
+
+// ============================================================
+// LANGUAGES
+// ============================================================
+
+const LANGUAGES = [
+    "Spanish (Latin America)",
+    "Portuguese (Brazil)",
+    "French",
+    "German",
+    "Italian",
+    "Dutch",
+    "Polish",
+    "Russian",
+    "Ukrainian",
+    "Turkish",
+    "Arabic",
+    "Hindi",
+    "Indonesian",
+    "Vietnamese",
+    "Korean",
+    "Japanese",
+    "Chinese (Simplified)",
+    "Chinese (Traditional)",
+    "Thai",
+    "Swedish"
+];
+
+// ============================================================
+// TIMING
+// ============================================================
+
+// General
+const PAGE_LOAD_DELAY = 3000;
+const VIDEO_LOAD_DELAY = 3000;
+
+// Navigation
+const NAVIGATION_TIMEOUT = 45000;
+const NAVIGATION_CHECKS = 45;
+const NAVIGATION_DELAY = 1000;
+
+// Pagination
+const PAGINATION_CHECKS = 20;
+const PAGINATION_DELAY = 2000;
+
+// English generation
+//
+// IMPORTANT:
+// This is deliberately separate from the translation timeout.
+//
+// YouTube can take a while to generate automatic captions.
+// 180 seconds = 3 minutes.
+const ENGLISH_GENERATION_TIMEOUT = 180;
+const ENGLISH_CHECK_DELAY = 2000;
+
+// English UI
+const ENGLISH_UI_CHECKS = 45;
+const ENGLISH_UI_DELAY = 1000;
+
+// General UI
+const ADD_LANGUAGE_CHECKS = 45;
+const ADD_LANGUAGE_DELAY = 1000;
+
+const LANGUAGE_CHECKS = 45;
+const LANGUAGE_CHECK_DELAY = 1000;
+
+const MANUAL_ADD_CHECKS = 45;
+const MANUAL_ADD_DELAY = 1000;
+
+const AUTO_TRANSLATE_CHECKS = 45;
+const AUTO_TRANSLATE_DELAY = 1000;
+
+const EDITOR_CHECKS = 45;
+const EDITOR_DELAY = 1000;
+
+const PUBLISH_CHECKS = 45;
+const PUBLISH_DELAY = 1000;
+
+// ============================================================
+// LANGUAGE ALIASES
+// ============================================================
+
+const LANGUAGE_ALIASES = {
+
+    "English": [
+        "English",
+        "English (United States)",
+        "English - United States",
+        "English (US)",
+        "English (United States) - Automatic"
+    ],
+
+    "Spanish (Latin America)": [
+        "Spanish (Latin America)",
+        "Spanish (Latin American)",
+        "Spanish - Latin America"
+    ],
+
+    "Portuguese (Brazil)": [
+        "Portuguese (Brazil)",
+        "Portuguese - Brazil",
+        "Brazilian Portuguese"
+    ],
+
+    "Chinese (Simplified)": [
+        "Chinese (Simplified)",
+        "Chinese - Simplified",
+        "Simplified Chinese"
+    ],
+
+    "Chinese (Traditional)": [
+        "Chinese (Traditional)",
+        "Chinese - Traditional",
+        "Traditional Chinese"
+    ]
+};
+
+// ============================================================
+// HELPERS
+// ============================================================
+
+async function sleep(ms) {
+    await new Promise(resolve => setTimeout(resolve, ms));
+}
+
+function normalizeText(text) {
+    return String(text || "")
+        .replace(/\u00a0/g, " ")
+        .replace(/\s+/g, " ")
+        .trim()
+        .toLowerCase();
+}
+
+function shortUrl(url) {
+    try {
+        const u = new URL(url);
+        return u.pathname + u.search;
+    } catch {
+        return url;
+    }
+}
+
+// ============================================================
+// DIALOG HANDLER
+// ============================================================
+
+function installDialogHandler(page) {
+
+    page.on("dialog", async dialog => {
+
+        console.log(
+            `⚠️ Browser dialog: ${dialog.type()} - ${dialog.message()}`
+        );
+
+        try {
+            await dialog.dismiss();
+        } catch {}
+    });
+}
+
+// ============================================================
+// CONNECT
+// ============================================================
+
+async function connect() {
+
+    console.log("Connecting to Chrome...");
+
+    const browser = await puppeteer.connect({
+        browserURL: "http://127.0.0.1:9222",
+        defaultViewport: null
+    });
+
+    console.log("✅ Connected to Chrome.");
+
+    const pages = await browser.pages();
+
+    console.log(
+        `Existing Chrome tabs: ${pages.length}`
+    );
+
+    let page =
+        pages.find(p =>
+            p.url().includes("studio.youtube.com")
+        );
+
+    if (!page) {
+        page = await browser.newPage();
+    }
+
+    installDialogHandler(page);
+
+    return {
+        browser,
+        page
+    };
+}
+
+// ============================================================
+// HARD NAVIGATION
+//
+// YouTube Studio sometimes refuses page.goto() with
+// ERR_ABORTED because of its SPA/beforeunload behavior.
+//
+// We therefore try:
+// 1. normal goto
+// 2. browser address/navigation through location
+// 3. keyboard address-bar navigation
+// ============================================================
+
+async function navigateTo(page, url, expectedVideoId = null) {
+
+    console.log("");
+    console.log("Navigating to:");
+    console.log(url);
+
+    const expectedPath =
+        new URL(url).pathname;
+
+    function correctUrl(current) {
+
+        if (!current)
+            return false;
+
+        if (!current.includes(expectedPath))
+            return false;
+
+        if (
+            expectedVideoId &&
+            !current.includes(
+                `/video/${expectedVideoId}/`
+            )
+        ) {
+            return false;
+        }
+
+        return true;
+    }
+
+    // --------------------------------------------------------
+    // Already there
+    // --------------------------------------------------------
+
+    if (correctUrl(page.url())) {
+
+        console.log("✅ Already on requested page.");
+
+        await sleep(PAGE_LOAD_DELAY);
+
+        return true;
+    }
+
+    // --------------------------------------------------------
+    // Attempt 1: Puppeteer goto
+    // --------------------------------------------------------
+
+    try {
+
+        await page.goto(url, {
+            waitUntil: "domcontentloaded",
+            timeout: NAVIGATION_TIMEOUT
+        });
+
+    } catch (err) {
+
+        console.log(
+            `⚠️ page.goto: ${err.message}`
+        );
+    }
+
+    await sleep(2000);
+
+    if (correctUrl(page.url())) {
+
+        console.log("✅ Navigation successful.");
+
+        await sleep(PAGE_LOAD_DELAY);
+
+        return true;
+    }
+
+    // --------------------------------------------------------
+    // Attempt 2: location.href
+    // --------------------------------------------------------
+
+    console.log(
+        "↪️ Trying browser-side navigation..."
+    );
+
+    try {
+
+        await page.evaluate(target => {
+            window.location.href = target;
+        }, url);
+
+    } catch (err) {
+
+        console.log(
+            `⚠️ Browser-side navigation: ${err.message}`
+        );
+    }
+
+    for (
+        let i = 1;
+        i <= NAVIGATION_CHECKS;
+        i++
+    ) {
+
+        if (correctUrl(page.url())) {
+
+            console.log(
+                "✅ Browser-side navigation successful."
+            );
+
+            await sleep(PAGE_LOAD_DELAY);
+
+            return true;
+        }
+
+        if (
+            i === 1 ||
+            i % 5 === 0
+        ) {
+
+            console.log(
+                `⏳ Waiting for navigation... ${i}/${NAVIGATION_CHECKS}`
+            );
+
+            console.log(
+                `   Current: ${shortUrl(page.url())}`
+            );
+        }
+
+        await sleep(NAVIGATION_DELAY);
+    }
+
+    // --------------------------------------------------------
+    // Attempt 3: Ctrl+L / Enter
+    // --------------------------------------------------------
+
+    console.log(
+        "↪️ Using Chrome address-bar navigation..."
+    );
+
+    try {
+
+        await page.bringToFront();
+
+        await page.keyboard.down("CTRL");
+        await page.keyboard.press("L");
+        await page.keyboard.up("CTRL");
+
+        await sleep(300);
+
+        await page.keyboard.type(
+            url,
+            { delay: 1 }
+        );
+
+        await page.keyboard.press("ENTER");
+
+    } catch (err) {
+
+        console.log(
+            `⚠️ Address-bar navigation failed: ${err.message}`
+        );
+    }
+
+    for (
+        let i = 1;
+        i <= NAVIGATION_CHECKS;
+        i++
+    ) {
+
+        if (correctUrl(page.url())) {
+
+            console.log(
+                "✅ Address-bar navigation successful."
+            );
+
+            await sleep(PAGE_LOAD_DELAY);
+
+            return true;
+        }
+
+        if (
+            i === 1 ||
+            i % 5 === 0
+        ) {
+
+            console.log(
+                `⏳ Waiting for navigation... ${i}/${NAVIGATION_CHECKS}`
+            );
+        }
+
+        await sleep(NAVIGATION_DELAY);
+    }
+
+    console.log(
+        "❌ Could not navigate to requested page."
+    );
+
+    console.log(
+        "Current URL:",
+        page.url()
+    );
+
+    return false;
+}
+
+// ============================================================
+// VISIBILITY
+// ============================================================
+
+async function scrapeVideoRows(page) {
+
+    return await page.evaluate(() => {
+
+        function visible(el) {
+
+            if (!el)
+                return false;
+
+            const rect =
+                el.getBoundingClientRect();
+
+            const style =
+                getComputedStyle(el);
+
+            return (
+                rect.width > 0 &&
+                rect.height > 0 &&
+                style.display !== "none" &&
+                style.visibility !== "hidden"
+            );
+        }
+
+        function clean(text) {
+
+            return String(text || "")
+                .replace(/\u00a0/g, " ")
+                .replace(/\s+/g, " ")
+                .trim();
+        }
+
+        // Search normal DOM + shadow DOM.
+        function allElements(selector) {
+
+            const output = [];
+
+            function walk(root) {
+
+                try {
+
+                    root
+                        .querySelectorAll(selector)
+                        .forEach(el =>
+                            output.push(el)
+                        );
+
+                    root
+                        .querySelectorAll("*")
+                        .forEach(el => {
+
+                            if (el.shadowRoot) {
+                                walk(el.shadowRoot);
+                            }
+
+                        });
+
+                } catch {}
+            }
+
+            walk(document);
+
+            return output;
+        }
+
+        const rows =
+            allElements("ytcp-video-row");
+
+        const results = [];
+        const seen = new Set();
+
+        for (const row of rows) {
+
+            if (!visible(row))
+                continue;
+
+            const rowText =
+                clean(
+                    row.innerText ||
+                    row.textContent ||
+                    ""
+                );
+
+            if (!rowText)
+                continue;
+
+            const lower =
+                rowText.toLowerCase();
+
+            // ------------------------------------------------
+            // Visibility
+            // ------------------------------------------------
+
+            const publicVideo =
+                /\bpublic\b/i.test(rowText);
+
+            if (!publicVideo)
+                continue;
+
+            if (
+                /\bprivate\b/i.test(rowText) ||
+                /\bunlisted\b/i.test(rowText) ||
+                /\bscheduled\b/i.test(rowText) ||
+                /\bdraft\b/i.test(rowText) ||
+                /members[\s-]*only/i.test(rowText)
+            ) {
+                continue;
+            }
+
+            // ------------------------------------------------
+            // Video ID
+            // ------------------------------------------------
+
+            const links = [
+                ...row.querySelectorAll(
+                    'a[href*="/video/"]'
+                )
+            ];
+
+            let videoId = null;
+
+            for (const link of links) {
+
+                const href =
+                    link.getAttribute("href") || "";
+
+                const match =
+                    href.match(
+                        /\/video\/([^/?#]+)/
+                    );
+
+                if (match) {
+
+                    videoId =
+                        match[1];
+
+                    break;
+                }
+            }
+
+            if (!videoId)
+                continue;
+
+            if (seen.has(videoId))
+                continue;
+
+            // ------------------------------------------------
+            // Title
+            // ------------------------------------------------
+
+            let title = "";
+
+            const titleSelectors = [
+                "#video-title",
+                "a#video-title",
+                ".video-title",
+                "[id='video-title']"
+            ];
+
+            for (const selector of titleSelectors) {
+
+                const el =
+                    row.querySelector(selector);
+
+                if (!el)
+                    continue;
+
+                const candidate =
+                    clean(
+                        el.innerText ||
+                        el.textContent ||
+                        ""
+                    );
+
+                if (
+                    candidate &&
+                    !/^\d+:\d+(:\d+)?$/.test(candidate)
+                ) {
+
+                    title =
+                        candidate;
+
+                    break;
+                }
+            }
+
+            // aria fallback
+            if (!title) {
+
+                const link =
+                    links[0];
+
+                if (link) {
+
+                    title =
+                        clean(
+                            link.getAttribute(
+                                "aria-label"
+                            ) ||
+                            link.getAttribute(
+                                "title"
+                            ) ||
+                            ""
+                        );
+                }
+            }
+
+            // Generic fallback
+            if (!title) {
+
+                const pieces =
+                    rowText
+                        .split(/\n+/)
+                        .map(clean)
+                        .filter(Boolean);
+
+                for (const piece of pieces) {
+
+                    const p =
+                        piece.toLowerCase();
+
+                    if (
+                        p === "public" ||
+                        p === "published" ||
+                        p === "private" ||
+                        p === "unlisted" ||
+                        p === "scheduled" ||
+                        p === "draft"
+                    ) {
+                        continue;
+                    }
+
+                    if (
+                        /^\d+:\d+(:\d+)?$/.test(piece)
+                    ) {
+                        continue;
+                    }
+
+                    if (piece.length > 2) {
+
+                        title =
+                            piece;
+
+                        break;
+                    }
+                }
+            }
+
+            seen.add(videoId);
+
+            results.push({
+                id: videoId,
+                title: title || "Untitled video"
+            });
+        }
+
+        return results;
+    });
+}
+
+// ============================================================
+// GET PAGE SIGNATURE
+// ============================================================
+
+async function getVideoPageSignature(page) {
+
+    return await page.evaluate(() => {
+
+        const rows = [
+            ...document.querySelectorAll(
+                "ytcp-video-row"
+            )
+        ];
+
+        return rows
+            .map(row => {
+
+                const link =
+                    row.querySelector(
+                        'a[href*="/video/"]'
+                    );
+
+                return (
+                    link?.getAttribute("href") ||
+                    ""
+                );
+            })
+            .filter(Boolean)
+            .join("|");
+    });
+}
+
+// ============================================================
+// NEXT BUTTON
+// ============================================================
+
+async function clickNextVideosPage(page) {
+
+    return await page.evaluate(() => {
+
+        function visible(el) {
+
+            if (!el)
+                return false;
+
+            const rect =
+                el.getBoundingClientRect();
+
+            const style =
+                getComputedStyle(el);
+
+            return (
+                rect.width > 0 &&
+                rect.height > 0 &&
+                style.display !== "none" &&
+                style.visibility !== "hidden"
+            );
+        }
+
+        function normalize(text) {
+
+            return String(text || "")
+                .replace(/\s+/g, " ")
+                .trim()
+                .toLowerCase();
+        }
+
+        const elements = [
+            ...document.querySelectorAll(
+                "button,[role='button'],tp-yt-paper-icon-button"
+            )
+        ]
+        .filter(visible);
+
+        const exactLabels = [
+            "next",
+            "next page",
+            "next page of videos",
+            "go to next page"
+        ];
+
+        // First explicit aria/title.
+        for (const el of elements) {
+
+            const aria =
+                normalize(
+                    el.getAttribute("aria-label")
+                );
+
+            const title =
+                normalize(
+                    el.getAttribute("title")
+                );
+
+            const disabled =
+                el.disabled ||
+                el.getAttribute(
+                    "aria-disabled"
+                ) === "true";
+
+            if (disabled)
+                continue;
+
+            if (
+                exactLabels.includes(aria) ||
+                exactLabels.includes(title)
+            ) {
+
+                el.scrollIntoView({
+                    block: "center"
+                });
+
+                el.click();
+
+                return true;
+            }
+        }
+
+        // Text Next.
+        for (const el of elements) {
+
+            if (
+                normalize(
+                    el.innerText ||
+                    el.textContent
+                ) !== "next"
+            ) {
+                continue;
+            }
+
+            const disabled =
+                el.disabled ||
+                el.getAttribute(
+                    "aria-disabled"
+                ) === "true";
+
+            if (disabled)
+                continue;
+
+            el.scrollIntoView({
+                block: "center"
+            });
+
+            el.click();
+
+            return true;
+        }
+
+        return false;
+    });
+}
+
+// ============================================================
+// WAIT FOR PAGE CHANGE
+// ============================================================
+
+async function waitForVideoPageChange(
+    page,
+    previousSignature,
+    previousIds
+) {
+
+    for (
+        let i = 1;
+        i <= PAGINATION_CHECKS;
+        i++
+    ) {
+
+        await sleep(PAGINATION_DELAY);
+
+        const signature =
+            await getVideoPageSignature(
+                page
+            );
+
+        const rows =
+            await scrapeVideoRows(page);
+
+        const newRows =
+            rows.filter(
+                x => !previousIds.has(x.id)
+            );
+
+        if (
+            signature &&
+            signature !== previousSignature &&
+            newRows.length
+        ) {
+
+            return true;
+        }
+    }
+
+    return false;
+}
+
+// ============================================================
+// FIND VIDEOS ON ONE TAB
+// ============================================================
+
+async function scanVideoTab(
+    page,
+    tabName,
+    url,
+    globalVideos
+) {
+
+    console.log("");
+    console.log(
+        "================================================"
+    );
+
+    console.log(
+        `📺 SCANNING ${tabName.toUpperCase()}`
+    );
+
+    console.log(
+        "================================================"
+    );
+
+    if (
+        !await navigateTo(
+            page,
+            url
+        )
+    ) {
+
+        console.log(
+            `❌ Could not open ${tabName}.`
+        );
+
+        return;
+    }
+
+    let pageNumber = 1;
+
+    while (true) {
+
+        console.log("");
+        console.log(
+            `📄 ${tabName} PAGE ${pageNumber}`
+        );
+
+        // Scroll so Studio renders rows.
+        await page.evaluate(() => {
+
+            window.scrollTo(
+                0,
+                document.documentElement.scrollHeight
+            );
+
+        });
+
+        await sleep(1500);
+
+        const found =
+            await scrapeVideoRows(page);
+
+        let added = 0;
+
+        for (const video of found) {
+
+            if (!globalVideos.has(video.id)) {
+
+                globalVideos.set(
+                    video.id,
+                    {
+                        ...video,
+                        type: tabName,
+                        url:
+                            translationsUrl(
+                                video.id
+                            )
+                    }
+                );
+
+                added++;
+            }
+        }
+
+        console.log(
+            `📜 ${tabName}: ${found.length} public rows`
+        );
+
+        console.log(
+            `➕ Added ${added} new videos`
+        );
+
+        console.log(
+            `📊 Total unique videos: ${globalVideos.size}`
+        );
+
+        // ----------------------------------------------------
+        // Pagination
+        // ----------------------------------------------------
+
+        const previousIds =
+            new Set(
+                found.map(x => x.id)
+            );
+
+        const previousSignature =
+            await getVideoPageSignature(
+                page
+            );
+
+        const clicked =
+            await clickNextVideosPage(
+                page
+            );
+
+        if (!clicked) {
+
+            console.log(
+                `✅ No more ${tabName} pages.`
+            );
+
+            break;
+        }
+
+        console.log(
+            `➡️ ${tabName}: Next clicked.`
+        );
+
+        const changed =
+            await waitForVideoPageChange(
+                page,
+                previousSignature,
+                previousIds
+            );
+
+        if (!changed) {
+
+            console.log(
+                "⚠️ Next clicked but page did not change."
+            );
+
+            // One last scrape.
+            await sleep(3000);
+
+            const retry =
+                await scrapeVideoRows(page);
+
+            let retryAdded = 0;
+
+            for (const video of retry) {
+
+                if (!globalVideos.has(video.id)) {
+
+                    globalVideos.set(
+                        video.id,
+                        {
+                            ...video,
+                            type: tabName,
+                            url:
+                                translationsUrl(
+                                    video.id
+                                )
+                        }
+                    );
+
+                    retryAdded++;
+                }
+            }
+
+            if (!retryAdded) {
+
+                console.log(
+                    "🛑 Stopping this tab."
+                );
+
+                break;
+            }
+        }
+
+        pageNumber++;
+
+        if (pageNumber > 1000) {
+
+            console.log(
+                "⚠️ Pagination safety limit reached."
+            );
+
+            break;
+        }
+    }
+}
+
+// ============================================================
+// FIND ALL PUBLIC VIDEOS
+// ============================================================
+
+async function findVideos(page) {
+
+    const videos =
+        new Map();
+
+    // Videos
+    await scanVideoTab(
+        page,
+        "Videos",
+        CHANNEL_VIDEOS_URL,
+        videos
+    );
+
+    // Shorts
+    await scanVideoTab(
+        page,
+        "Shorts",
+        CHANNEL_SHORTS_URL,
+        videos
+    );
+
+    // Live
+    await scanVideoTab(
+        page,
+        "Live",
+        CHANNEL_LIVE_URL,
+        videos
+    );
+
+    const result =
+        [...videos.values()];
+
+    console.log("");
+    console.log(
+        "================================================"
+    );
+
+    console.log(
+        `🎉 FOUND ${result.length} UNIQUE PUBLIC VIDEOS`
+    );
+
+    console.log(
+        "================================================"
+    );
+
+    const counts = {};
+
+    for (const video of result) {
+
+        counts[video.type] =
+            (counts[video.type] || 0) + 1;
+    }
+
+    console.log(
+        "Videos:",
+        counts.Videos || 0
+    );
+
+    console.log(
+        "Shorts:",
+        counts.Shorts || 0
+    );
+
+    console.log(
+        "Live:",
+        counts.Live || 0
+    );
+
+    return result;
+}
+
+// ============================================================
+// DOM CLICK HELPER
+// ============================================================
+
+async function clickExactText(
+    page,
+    wantedTexts,
+    options = {}
+) {
+
+    const timeout =
+        options.timeout || 45000;
+
+    const interval =
+        options.interval || 1000;
+
+    const texts =
+        wantedTexts.map(
+            normalizeText
+        );
+
+    const started =
+        Date.now();
+
+    while (
+        Date.now() - started <
+        timeout
+    ) {
+
+        const clicked =
+            await page.evaluate(
+                texts => {
+
+                    function visible(el) {
+
+                        if (!el)
+                            return false;
+
+                        const rect =
+                            el.getBoundingClientRect();
+
+                        const style =
+                            getComputedStyle(el);
+
+                        return (
+                            rect.width > 0 &&
+                            rect.height > 0 &&
+                            style.display !== "none" &&
+                            style.visibility !== "hidden"
+                        );
+                    }
+
+                    function normalize(text) {
+
+                        return String(text || "")
+                            .replace(/\u00a0/g, " ")
+                            .replace(/\s+/g, " ")
+                            .trim()
+                            .toLowerCase();
+                    }
+
+                    const elements = [
+                        ...document.querySelectorAll(
+                            "*"
+                        )
+                    ]
+                    .filter(visible);
+
+                    const candidates =
+                        elements.filter(el => {
+
+                            return texts.includes(
+                                normalize(
+                                    el.innerText ||
+                                    el.textContent ||
+                                    ""
+                                )
+                            );
+                        });
+
+                    // Prefer buttons.
+                    candidates.sort(
+                        (a, b) => {
+
+                            const aButton =
+                                a.tagName === "BUTTON" ||
+                                a.getAttribute("role") === "button";
+
+                            const bButton =
+                                b.tagName === "BUTTON" ||
+                                b.getAttribute("role") === "button";
+
+                            if (
+                                aButton &&
+                                !bButton
+                            )
+                                return -1;
+
+                            if (
+                                !aButton &&
+                                bButton
+                            )
+                                return 1;
+
+                            const ar =
+                                a.getBoundingClientRect();
+
+                            const br =
+                                b.getBoundingClientRect();
+
+                            return (
+                                ar.width *
+                                ar.height -
+                                br.width *
+                                br.height
+                            );
+                        }
+                    );
+
+                    if (!candidates.length)
+                        return false;
+
+                    const target =
+                        candidates[0];
+
+                    try {
+
+                        target.scrollIntoView({
+                            block: "center",
+                            inline: "center"
+                        });
+
+                    } catch {}
+
+                    try {
+
+                        target.click();
+
+                        return true;
+
+                    } catch {}
+
+                    return false;
+                },
+                texts
+            );
+
+        if (clicked)
+            return true;
+
+        await sleep(interval);
+    }
+
+    return false;
+}
+
+// ============================================================
+// CHECK ENGLISH ROW
+//
+// THIS IS THE IMPORTANT PART.
+//
+// We explicitly inspect the English row.
+//
+// We DO NOT:
+// - accept a generic subtitle editor
+// - accept a generic Publish button
+// - accept "edit subtitles" for another language
+//
+// We need an actual English row.
+// ============================================================
+
+async function inspectEnglishRow(page) {
+
+    return await page.evaluate(() => {
+
+        function visible(el) {
+
+            if (!el)
+                return false;
+
+            const rect =
+                el.getBoundingClientRect();
+
+            const style =
+                getComputedStyle(el);
+
+            return (
+                rect.width > 0 &&
+                rect.height > 0 &&
+                style.display !== "none" &&
+                style.visibility !== "hidden"
+            );
+        }
+
+        function clean(text) {
+
+            return String(text || "")
+                .replace(/\u00a0/g, " ")
+                .replace(/\s+/g, " ")
+                .trim();
+        }
+
+        function norm(text) {
+            return clean(text).toLowerCase();
+        }
+
+        const elements = [
+            ...document.querySelectorAll("*")
+        ]
+        .filter(visible);
+
+        const englishLabels =
+            elements.filter(el => {
+
+                const text =
+                    norm(
+                        el.innerText ||
+                        el.textContent ||
+                        ""
+                    );
+
+                return (
+                    text === "english" ||
+                    text === "english (united states)" ||
+                    text === "english (us)" ||
+                    text === "english - united states"
+                );
+            });
+
+        // ----------------------------------------------------
+        // Find the actual row around English.
+        // ----------------------------------------------------
+
+        for (const english of englishLabels) {
+
+            let row =
+                english;
+
+            for (
+                let level = 0;
+                level < 15 && row;
+                level++
+            ) {
+
+                const rowText =
+                    clean(
+                        row.innerText ||
+                        row.textContent ||
+                        ""
+                    );
+
+                const lower =
+                    norm(rowText);
+
+                // A useful row should contain English plus
+                // some subtitle-related state/action.
+                if (
+                    lower.includes("english") &&
+                    (
+                        lower.includes("automatic") ||
+                        lower.includes("published") ||
+                        lower.includes("draft") ||
+                        lower.includes("edit subtitles") ||
+                        lower.includes("edit") ||
+                        lower.includes("add")
+                    )
+                ) {
+
+                    const buttons = [
+                        ...row.querySelectorAll(
+                            "button,[role='button'],a"
+                        )
+                    ]
+                    .filter(visible);
+
+                    const buttonData =
+                        buttons.map(button => {
+
+                            return {
+                                text: clean(
+                                    button.innerText ||
+                                    button.textContent ||
+                                    ""
+                                ),
+                                aria: clean(
+                                    button.getAttribute(
+                                        "aria-label"
+                                    ) || ""
+                                ),
+                                title: clean(
+                                    button.getAttribute(
+                                        "title"
+                                    ) || ""
+                                )
+                            };
+                        });
+
+                    return {
+                        found: true,
+                        rowText,
+                        lower,
+                        buttons: buttonData
+                    };
+                }
+
+                row =
+                    row.parentElement;
+            }
+        }
+
+        // ----------------------------------------------------
+        // Also look for explicit automatic-caption messages.
+        // ----------------------------------------------------
+
+        const body =
+            norm(
+                document.body.innerText || ""
+            );
+
+        const generating =
+            body.includes(
+                "generating automatic subtitles"
+            ) ||
+            body.includes(
+                "generating subtitles"
+            ) ||
+            body.includes(
+                "automatic captions are being generated"
+            ) ||
+            body.includes(
+                "generating captions"
+            ) ||
+            body.includes(
+                "automatic captions are still being generated"
+            );
+
+        return {
+            found: false,
+            generating,
+            body
+        };
+    });
+}
+
+// ============================================================
+// FIND ENGLISH EDIT SUBTITLES BUTTON
+//
+// IMPORTANT:
+// This function only searches inside the English row.
+// ============================================================
+
+async function findEnglishEditButton(page) {
+
+    return await page.evaluate(() => {
+
+        function visible(el) {
+
+            if (!el)
+                return false;
+
+            const rect =
+                el.getBoundingClientRect();
+
+            const style =
+                getComputedStyle(el);
+
+            return (
+                rect.width > 0 &&
+                rect.height > 0 &&
+                style.display !== "none" &&
+                style.visibility !== "hidden"
+            );
+        }
+
+        function clean(text) {
+
+            return String(text || "")
+                .replace(/\u00a0/g, " ")
+                .replace(/\s+/g, " ")
+                .trim()
+                .toLowerCase();
+        }
+
+        const labels = [
+            ...document.querySelectorAll("*")
+        ]
+        .filter(visible)
+        .filter(el => {
+
+            const text =
+                clean(
+                    el.innerText ||
+                    el.textContent ||
+                    ""
+                );
+
+            return (
+                text === "english" ||
+                text === "english (united states)" ||
+                text === "english (us)" ||
+                text === "english - united states"
+            );
+        });
+
+        for (const english of labels) {
+
+            let row =
+                english;
+
+            for (
+                let level = 0;
+                level < 15 && row;
+                level++
+            ) {
+
+                const rowText =
+                    clean(
+                        row.innerText ||
+                        row.textContent ||
+                        ""
+                    );
+
+                if (
+                    !rowText.includes("english")
+                ) {
+                    row =
+                        row.parentElement;
+
+                    continue;
+                }
+
+                const candidates = [
+                    ...row.querySelectorAll(
+                        "button,[role='button'],a"
+                    )
+                ]
+                .filter(visible);
+
+                for (const el of candidates) {
+
+                    const text =
+                        clean(
+                            el.innerText ||
+                            el.textContent ||
+                            ""
+                        );
+
+                    const aria =
+                        clean(
+                            el.getAttribute(
+                                "aria-label"
+                            ) || ""
+                        );
+
+                    const title =
+                        clean(
+                            el.getAttribute(
+                                "title"
+                            ) || ""
+                        );
+
+                    if (
+                        text === "edit subtitles" ||
+                        text === "edit" ||
+                        aria === "edit subtitles" ||
+                        aria.includes("edit subtitles") ||
+                        title === "edit subtitles" ||
+                        title.includes("edit subtitles")
+                    ) {
+
+                        try {
+
+                            el.scrollIntoView({
+                                block: "center"
+                            });
+
+                            el.click();
+
+                            return true;
+
+                        } catch {}
+                    }
+                }
+
+                row =
+                    row.parentElement;
+            }
+        }
+
+        return false;
+    });
+}
+
+// ============================================================
+// PUBLISH ENGLISH
+//
+// Once Edit subtitles opens the English editor,
+// this waits specifically for Publish.
+// ============================================================
+
+async function publishEnglish(page) {
+
+    console.log(
+        "🇬🇧 Looking for English Publish..."
+    );
+
+    for (
+        let attempt = 1;
+        attempt <= PUBLISH_CHECKS;
+        attempt++
+    ) {
+
+        const clicked =
+            await page.evaluate(() => {
+
+                function visible(el) {
+
+                    if (!el)
+                        return false;
+
+                    const rect =
+                        el.getBoundingClientRect();
+
+                    const style =
+                        getComputedStyle(el);
+
+                    return (
+                        rect.width > 0 &&
+                        rect.height > 0 &&
+                        style.display !== "none" &&
+                        style.visibility !== "hidden"
+                    );
+                }
+
+                const buttons = [
+                    ...document.querySelectorAll(
+                        "button,[role='button']"
+                    )
+                ]
+                .filter(visible);
+
+                const candidates =
+                    buttons.filter(button => {
+
+                        const text =
+                            (
+                                button.innerText ||
+                                button.textContent ||
+                                ""
+                            )
+                            .replace(/\s+/g, " ")
+                            .trim()
+                            .toLowerCase();
+
+                        const aria =
+                            (
+                                button.getAttribute(
+                                    "aria-label"
+                                ) || ""
+                            )
+                            .toLowerCase();
+
+                        return (
+                            text === "publish" ||
+                            aria === "publish"
+                        );
+                    });
+
+                if (!candidates.length)
+                    return false;
+
+                const button =
+                    candidates[0];
+
+                try {
+
+                    button.scrollIntoView({
+                        block: "center"
+                    });
+
+                } catch {}
+
+                try {
+
+                    button.click();
+
+                    return true;
+
+                } catch {}
+
+                return false;
+            });
+
+        if (clicked) {
+
+            console.log(
+                "📤 English: Publish clicked."
+            );
+
+            await sleep(5000);
+
+            return true;
+        }
+
+        if (
+            attempt === 1 ||
+            attempt % 10 === 0
+        ) {
+
+            console.log(
+                `⏳ Waiting for English Publish... ${attempt}/${PUBLISH_CHECKS}`
+            );
+        }
+
+        await sleep(PUBLISH_DELAY);
+    }
+
+    console.log(
+        "❌ English Publish never appeared."
+    );
+
+    return false;
+}
+
+// ============================================================
+// PREPARE ENGLISH SOURCE
+//
+// THIS IS THE CRITICAL FUNCTION.
+//
+// Flow:
+//
+// NO ENGLISH
+//     ↓
+// wait for YouTube automatic transcript
+//     ↓
+// ENGLISH APPEARS
+//     ↓
+// click Edit subtitles INSIDE ENGLISH ROW
+//     ↓
+// Publish
+//     ↓
+// ONLY THEN translations
+// ============================================================
+
+async function prepareEnglish(page, video) {
+
+    console.log("");
+    console.log(
+        "================================================"
+    );
+
+    console.log(
+        "🇬🇧 PREPARING ENGLISH SOURCE TRANSCRIPT"
+    );
+
+    console.log(
+        "================================================"
+    );
+
+    console.log(
+        `⏱️ Maximum English wait: ${ENGLISH_GENERATION_TIMEOUT} seconds`
+    );
+
+    const started =
+        Date.now();
+
+    let editClicked =
+        false;
+
+    while (
+        Date.now() - started <
+        ENGLISH_GENERATION_TIMEOUT * 1000
+    ) {
+
+        const state =
+            await inspectEnglishRow(
+                page
+            );
+
+        // ----------------------------------------------------
+        // English exists.
+        // ----------------------------------------------------
+
+        if (state.found) {
+
+            console.log(
+                "🇬🇧 English subtitle row detected."
+            );
+
+            console.log(
+                `   ${state.rowText || ""}`
+            );
+
+            // ------------------------------------------------
+            // If not yet in editor, click English's
+            // Edit subtitles button.
+            // ------------------------------------------------
+
+            if (!editClicked) {
+
+                const clicked =
+                    await findEnglishEditButton(
+                        page
+                    );
+
+                if (clicked) {
+
+                    console.log(
+                        "✅ English → Edit subtitles clicked."
+                    );
+
+                    editClicked = true;
+
+                    await sleep(4000);
+
+                } else {
+
+                    // Sometimes the row is still loading.
+                    console.log(
+                        "⏳ English exists but Edit subtitles is not ready yet..."
+                    );
+
+                    await sleep(
+                        ENGLISH_UI_DELAY
+                    );
+
+                    continue;
+                }
+            }
+
+            // ------------------------------------------------
+            // Once editor is open, ONLY look for English
+            // Publish.
+            // ------------------------------------------------
+
+            if (editClicked) {
+
+                const published =
+                    await publishEnglish(
+                        page
+                    );
+
+                if (published) {
+
+                    console.log(
+                        "✅ ENGLISH SOURCE TRANSCRIPT PUBLISHED."
+                    );
+
+                    return true;
+                }
+
+                // Don't immediately start translations.
+                // Keep waiting for the English editor to finish.
+                console.log(
+                    "⏳ English editor opened but Publish is not ready yet."
+                );
+
+                await sleep(
+                    ENGLISH_UI_DELAY
+                );
+
+                continue;
+            }
+        }
+
+        // ----------------------------------------------------
+        // No English row yet.
+        //
+        // This is where the old script was failing.
+        // We DO NOT create translations here.
+        // ----------------------------------------------------
+
+        console.log(
+            `⏳ Waiting for English automatic transcript... ${Math.floor((Date.now() - started) / 1000)}/${ENGLISH_GENERATION_TIMEOUT}s`
+        );
+
+        await sleep(
+            ENGLISH_CHECK_DELAY
+        );
+    }
+
+    console.log("");
+    console.log(
+        "❌ ENGLISH TRANSCRIPT NEVER BECAME AVAILABLE."
+    );
+
+    console.log(
+        `⏭️ Skipping ${video.title}`
+    );
+
+    return false;
+}
+
+// ============================================================
+// CHECK EXISTING LANGUAGE
+// ============================================================
+
+async function languageAlreadyExists(
+    page,
+    language
+) {
+
+    const aliases =
+        LANGUAGE_ALIASES[language] ||
+        [language];
+
+    return await page.evaluate(
+        aliases => {
+
+            function normalize(text) {
+
+                return String(text || "")
+                    .replace(/\u00a0/g, " ")
+                    .replace(/\s+/g, " ")
+                    .trim()
+                    .toLowerCase();
+            }
+
+            function visible(el) {
+
+                if (!el)
+                    return false;
+
+                const rect =
+                    el.getBoundingClientRect();
+
+                const style =
+                    getComputedStyle(el);
+
+                return (
+                    rect.width > 0 &&
+                    rect.height > 0 &&
+                    style.display !== "none" &&
+                    style.visibility !== "hidden"
+                );
+            }
+
+            const wanted =
+                aliases.map(normalize);
+
+            const labels = [
+                ...document.querySelectorAll("*")
+            ]
+            .filter(visible);
+
+            for (const el of labels) {
+
+                const text =
+                    normalize(
+                        el.innerText ||
+                        el.textContent ||
+                        ""
+                    );
+
+                if (!wanted.includes(text))
+                    continue;
+
+                let row =
+                    el;
+
+                for (
+                    let level = 0;
+                    level < 12 && row;
+                    level++
+                ) {
+
+                    const rowText =
+                        normalize(
+                            row.innerText ||
+                            row.textContent ||
+                            ""
+                        );
+
+                    if (
+                        rowText.includes("published") ||
+                        rowText.includes("automatic") ||
+                        rowText.includes("manual") ||
+                        rowText.includes("subtitle") ||
+                        rowText.includes("edit")
+                    ) {
+
+                        return true;
+                    }
+
+                    row =
+                        row.parentElement;
+                }
+            }
+
+            return false;
+        },
+        aliases
+    );
+}
+
+// ============================================================
+// ADD LANGUAGE
+// ============================================================
+
+async function openAddLanguage(page) {
+
+    console.log(
+        "🌎 Looking for Add language..."
+    );
+
+    for (
+        let attempt = 1;
+        attempt <= ADD_LANGUAGE_CHECKS;
+        attempt++
+    ) {
+
+        const clicked =
+            await clickExactText(
+                page,
+                ["Add language"],
+                {
+                    timeout: 1000,
+                    interval: 100
+                }
+            );
+
+        if (clicked) {
+
+            console.log(
+                "✅ Add language opened."
+            );
+
+            await sleep(1500);
+
+            return true;
+        }
+
+        if (
+            attempt === 1 ||
+            attempt % 10 === 0
+        ) {
+
+            console.log(
+                `⏳ Looking for Add language... ${attempt}/${ADD_LANGUAGE_CHECKS}`
+            );
+        }
+
+        await sleep(
+            ADD_LANGUAGE_DELAY
+        );
+    }
+
+    console.log(
+        "❌ Add language not found."
+    );
+
+    return false;
+}
+
+// ============================================================
+// SELECT LANGUAGE
+// ============================================================
+
+async function selectLanguage(
+    page,
+    wanted
+) {
+
+    console.log(
+        `🌎 Selecting ${wanted}...`
+    );
+
+    const aliases =
+        LANGUAGE_ALIASES[wanted] ||
+        [wanted];
+
+    const normalizedAliases =
+        aliases.map(
+            normalizeText
+        );
+
+    for (
+        let attempt = 1;
+        attempt <= LANGUAGE_CHECKS;
+        attempt++
+    ) {
+
+        const clicked =
+            await page.evaluate(
+                aliases => {
+
+                    function visible(el) {
+
+                        if (!el)
+                            return false;
+
+                        const rect =
+                            el.getBoundingClientRect();
+
+                        const style =
+                            getComputedStyle(el);
+
+                        return (
+                            rect.width > 0 &&
+                            rect.height > 0 &&
+                            style.display !== "none" &&
+                            style.visibility !== "hidden"
+                        );
+                    }
+
+                    function normalize(text) {
+
+                        return String(text || "")
+                            .replace(/\u00a0/g, " ")
+                            .replace(/\s+/g, " ")
+                            .trim()
+                            .toLowerCase();
+                    }
+
+                    const candidates = [
+                        ...document.querySelectorAll("*")
+                    ]
+                    .filter(visible)
+                    .filter(el => {
+
+                        return aliases.includes(
+                            normalize(
+                                el.innerText ||
+                                el.textContent ||
+                                ""
+                            )
+                        );
+                    });
+
+                    candidates.sort(
+                        (a, b) => {
+
+                            const ar =
+                                a.getBoundingClientRect();
+
+                            const br =
+                                b.getBoundingClientRect();
+
+                            return (
+                                ar.width *
+                                ar.height -
+                                br.width *
+                                br.height
+                            );
+                        }
+                    );
+
+                    if (!candidates.length)
+                        return false;
+
+                    const target =
+                        candidates[0];
+
+                    try {
+
+                        target.scrollIntoView({
+                            block: "center"
+                        });
+
+                    } catch {}
+
+                    try {
+
+                        target.click();
+
+                        return true;
+
+                    } catch {}
+
+                    return false;
+                },
+                normalizedAliases
+            );
+
+        if (clicked) {
+
+            console.log(
+                `✅ ${wanted} selected.`
+            );
+
+            await sleep(1500);
+
+            return true;
+        }
+
+        if (
+            attempt === 1 ||
+            attempt % 10 === 0
+        ) {
+
+            console.log(
+                `⏳ Looking for ${wanted}... ${attempt}/${LANGUAGE_CHECKS}`
+            );
+        }
+
+        await sleep(
+            LANGUAGE_CHECK_DELAY
+        );
+    }
+
+    console.log(
+        `❌ Could not select ${wanted}.`
+    );
+
+    return false;
+}
+
+// ============================================================
+// MANUAL SUBTITLES → ADD
+// ============================================================
+
+async function clickManualSubtitlesAdd(page) {
+
+    console.log(
+        "🔎 Looking for Manual subtitles → Add..."
+    );
+
+    for (
+        let attempt = 1;
+        attempt <= MANUAL_ADD_CHECKS;
+        attempt++
+    ) {
+
+        const clicked =
+            await page.evaluate(() => {
+
+                function visible(el) {
+
+                    if (!el)
+                        return false;
+
+                    const rect =
+                        el.getBoundingClientRect();
+
+                    const style =
+                        getComputedStyle(el);
+
+                    return (
+                        rect.width > 0 &&
+                        rect.height > 0 &&
+                        style.display !== "none" &&
+                        style.visibility !== "hidden"
+                    );
+                }
+
+                const labels = [
+                    ...document.querySelectorAll("*")
+                ]
+                .filter(visible)
+                .filter(el => {
+
+                    return (
+                        (
+                            el.innerText ||
+                            el.textContent ||
+                            ""
+                        )
+                        .replace(/\s+/g, " ")
+                        .trim()
+                        .toLowerCase() ===
+                        "manual subtitles"
+                    );
+                });
+
+                for (const label of labels) {
+
+                    let row =
+                        label;
+
+                    for (
+                        let level = 0;
+                        level < 10 && row;
+                        level++
+                    ) {
+
+                        const buttons = [
+                            ...row.querySelectorAll(
+                                "button,[role='button'],[tabindex]"
+                            )
+                        ]
+                        .filter(visible);
+
+                        for (const button of buttons) {
+
+                            const text =
+                                (
+                                    button.innerText ||
+                                    button.textContent ||
+                                    ""
+                                )
+                                .replace(/\s+/g, " ")
+                                .trim()
+                                .toLowerCase();
+
+                            const aria =
+                                (
+                                    button.getAttribute(
+                                        "aria-label"
+                                    ) || ""
+                                )
+                                .toLowerCase();
+
+                            const title =
+                                (
+                                    button.getAttribute(
+                                        "title"
+                                    ) || ""
+                                )
+                                .toLowerCase();
+
+                            if (
+                                text === "add" ||
+                                aria === "add" ||
+                                title === "add" ||
+                                aria.includes("add subtitles") ||
+                                title.includes("add subtitles")
+                            ) {
+
+                                try {
+
+                                    button.scrollIntoView({
+                                        block: "center"
+                                    });
+
+                                } catch {}
+
+                                button.click();
+
+                                return true;
+                            }
+                        }
+
+                        row =
+                            row.parentElement;
+                    }
+                }
+
+                return false;
+            });
+
+        if (clicked) {
+
+            console.log(
+                "✅ Manual subtitles → Add clicked."
+            );
+
+            await sleep(2500);
+
+            return true;
+        }
+
+        if (
+            attempt === 1 ||
+            attempt % 10 === 0
+        ) {
+
+            console.log(
+                `⏳ Looking for Manual subtitles Add... ${attempt}/${MANUAL_ADD_CHECKS}`
+            );
+        }
+
+        await sleep(
+            MANUAL_ADD_DELAY
+        );
+    }
+
+    console.log(
+        "❌ Manual subtitles Add not found."
+    );
+
+    return false;
+}
+
+// ============================================================
+// AUTO TRANSLATE
+// ============================================================
+
+async function clickAutoTranslate(page) {
+
+    console.log(
+        "🔎 Looking for Auto-translate..."
+    );
+
+    for (
+        let attempt = 1;
+        attempt <= AUTO_TRANSLATE_CHECKS;
+        attempt++
+    ) {
+
+        const clicked =
+            await clickExactText(
+                page,
+                ["Auto-translate"],
+                {
+                    timeout: 1000,
+                    interval: 100
+                }
+            );
+
+        if (clicked) {
+
+            console.log(
+                "✅ Auto-translate clicked."
+            );
+
+            await sleep(2500);
+
+            return true;
+        }
+
+        if (
+            attempt === 1 ||
+            attempt % 10 === 0
+        ) {
+
+            console.log(
+                `⏳ Looking for Auto-translate... ${attempt}/${AUTO_TRANSLATE_CHECKS}`
+            );
+        }
+
+        await sleep(
+            AUTO_TRANSLATE_DELAY
+        );
+    }
+
+    console.log(
+        "❌ Auto-translate not found."
+    );
+
+    return false;
+}
+
+// ============================================================
+// WAIT FOR SUBTITLE EDITOR
+// ============================================================
+
+async function waitForSubtitleEditor(
+    page,
+    language
+) {
+
+    console.log(
+        `⏳ Waiting for ${language} subtitle editor...`
+    );
+
+    for (
+        let attempt = 1;
+        attempt <= EDITOR_CHECKS;
+        attempt++
+    ) {
+
+        const ready =
+            await page.evaluate(() => {
+
+                function visible(el) {
+
+                    if (!el)
+                        return false;
+
+                    const rect =
+                        el.getBoundingClientRect();
+
+                    const style =
+                        getComputedStyle(el);
+
+                    return (
+                        rect.width > 0 &&
+                        rect.height > 0 &&
+                        style.display !== "none" &&
+                        style.visibility !== "hidden"
+                    );
+                }
+
+                const body =
+                    (
+                        document.body.innerText ||
+                        ""
+                    )
+                    .toLowerCase();
+
+                const publish =
+                    [
+                        ...document.querySelectorAll(
+                            "button"
+                        )
+                    ]
+                    .some(button => {
+
+                        if (!visible(button))
+                            return false;
+
+                        return (
+                            (
+                                button.innerText ||
+                                ""
+                            )
+                            .replace(/\s+/g, " ")
+                            .trim()
+                            .toLowerCase() ===
+                            "publish"
+                        );
+                    });
+
+                return (
+                    body.includes("subtitles timeline") ||
+                    body.includes("subtitle timeline") ||
+                    body.includes("edit transcript") ||
+                    body.includes("subtitles preview") ||
+                    publish
+                );
+            });
+
+        if (ready) {
+
+            console.log(
+                `✅ ${language} subtitle editor ready.`
+            );
+
+            return true;
+        }
+
+        if (
+            attempt === 1 ||
+            attempt % 10 === 0
+        ) {
+
+            console.log(
+                `⏳ Waiting for editor... ${attempt}/${EDITOR_CHECKS}`
+            );
+        }
+
+        await sleep(
+            EDITOR_DELAY
+        );
+    }
+
+    console.log(
+        `❌ ${language} subtitle editor did not appear.`
+    );
+
+    return false;
+}
+
+// ============================================================
+// PUBLISH TRANSLATION
+// ============================================================
+
+async function clickPublish(
+    page,
+    language
+) {
+
+    console.log(
+        `🔎 Looking for Publish (${language})...`
+    );
+
+    for (
+        let attempt = 1;
+        attempt <= PUBLISH_CHECKS;
+        attempt++
+    ) {
+
+        const clicked =
+            await page.evaluate(() => {
+
+                function visible(el) {
+
+                    if (!el)
+                        return false;
+
+                    const rect =
+                        el.getBoundingClientRect();
+
+                    const style =
+                        getComputedStyle(el);
+
+                    return (
+                        rect.width > 0 &&
+                        rect.height > 0 &&
+                        style.display !== "none" &&
+                        style.visibility !== "hidden"
+                    );
+                }
+
+                const buttons = [
+                    ...document.querySelectorAll(
+                        "button"
+                    )
+                ]
+                .filter(visible);
+
+                const button =
+                    buttons.find(
+                        b =>
+                            (
+                                b.innerText ||
+                                ""
+                            )
+                            .replace(/\s+/g, " ")
+                            .trim()
+                            .toLowerCase() ===
+                            "publish"
+                    );
+
+                if (!button)
+                    return false;
+
+                button.click();
+
+                return true;
+            });
+
+        if (clicked) {
+
+            console.log(
+                `📤 ${language}: Publish clicked.`
+            );
+
+            await sleep(4000);
+
+            return true;
+        }
+
+        if (
+            attempt === 1 ||
+            attempt % 10 === 0
+        ) {
+
+            console.log(
+                `⏳ Waiting for Publish... ${attempt}/${PUBLISH_CHECKS}`
+            );
+        }
+
+        await sleep(
+            PUBLISH_DELAY
+        );
+    }
+
+    console.log(
+        `❌ ${language}: Publish never appeared.`
+    );
+
+    return false;
+}
+
+// ============================================================
+// PROCESS LANGUAGE
+// ============================================================
+
+async function processLanguage(
+    page,
+    language,
+    completedLanguages
+) {
+
+    console.log("");
+    console.log(
+        "------------------------------------------------"
+    );
+
+    console.log(
+        `🌎 LANGUAGE: ${language}`
+    );
+
+    console.log(
+        "------------------------------------------------"
+    );
+
+    if (
+        completedLanguages.has(
+            language
+        )
+    ) {
+
+        console.log(
+            `⏭️ ${language} already completed.`
+        );
+
+        return true;
+    }
+
+    const exists =
+        await languageAlreadyExists(
+            page,
+            language
+        );
+
+    if (exists) {
+
+        console.log(
+            `⏭️ ${language} already has subtitles — SKIPPING.`
+        );
+
+        completedLanguages.add(
+            language
+        );
+
+        return true;
+    }
+
+    console.log(
+        `🆕 ${language} does not have subtitles — creating.`
+    );
+
+    if (
+        !await openAddLanguage(
+            page
+        )
+    ) {
+        return false;
+    }
+
+    if (
+        !await selectLanguage(
+            page,
+            language
+        )
+    ) {
+        return false;
+    }
+
+    if (
+        !await clickManualSubtitlesAdd(
+            page
+        )
+    ) {
+        return false;
+    }
+
+    if (
+        !await clickAutoTranslate(
+            page
+        )
+    ) {
+
+        console.log(
+            `❌ Auto-translate unavailable for ${language}.`
+        );
+
+        console.log(
+            "⏭️ Not publishing empty subtitle track."
+        );
+
+        return false;
+    }
+
+    if (
+        !await waitForSubtitleEditor(
+            page,
+            language
+        )
+    ) {
+        return false;
+    }
+
+    const published =
+        await clickPublish(
+            page,
+            language
+        );
+
+    if (published) {
+
+        completedLanguages.add(
+            language
+        );
+
+        console.log(
+            `✅ Finished ${language}.`
+        );
+    }
+
+    return published;
+}
+
+// ============================================================
+// PROCESS VIDEO
+// ============================================================
+
+async function processVideo(
+    page,
+    video,
+    index,
+    total
+) {
+
+    console.log("");
+    console.log(
+        "################################################"
+    );
+
+    console.log(
+        `VIDEO ${index}/${total}`
+    );
+
+    console.log(
+        `TITLE: ${video.title}`
+    );
+
+    console.log(
+        `ID: ${video.id}`
+    );
+
+    console.log(
+        `TYPE: ${video.type}`
+    );
+
+    console.log(
+        `VISIBILITY: PUBLIC`
+    );
+
+    console.log(
+        "################################################"
+    );
+
+    // --------------------------------------------------------
+    // Open translations
+    // --------------------------------------------------------
+
+    const opened =
+        await navigateTo(
+            page,
+            translationsUrl(
+                video.id
+            ),
+            video.id
+        );
+
+    if (!opened) {
+
+        console.log(
+            `⚠️ Could not navigate to video ${video.id}.`
+        );
+
+        return;
+    }
+
+    // HARD verification.
+    if (
+        !page.url().includes(
+            `/video/${video.id}/`
+        )
+    ) {
+
+        console.log(
+            "❌ VIDEO ID VERIFICATION FAILED."
+        );
+
+        return;
+    }
+
+    console.log(
+        "✅ Correct video loaded."
+    );
+
+    await sleep(
+        VIDEO_LOAD_DELAY
+    );
+
+    // ========================================================
+    // ABSOLUTELY FIRST: ENGLISH
+    // ========================================================
+
+    const englishReady =
+        await prepareEnglish(
+            page,
+            video
+        );
+
+    if (!englishReady) {
+
+        console.log("");
+        console.log(
+            "🚫 ENGLISH WAS NOT GENERATED."
+        );
+
+        console.log(
+            "🚫 NO TRANSLATIONS WILL BE CREATED."
+        );
+
+        console.log(
+            `⏭️ Skipping video ${index}/${total}.`
+        );
+
+        return;
+    }
+
+    // ========================================================
+    // RETURN TO TRANSLATIONS AFTER ENGLISH EDITOR
+    // ========================================================
+
+    console.log(
+        "↩️ Returning to translations page..."
+    );
+
+    const backToTranslations =
+        await navigateTo(
+            page,
+            translationsUrl(
+                video.id
+            ),
+            video.id
+        );
+
+    if (!backToTranslations) {
+
+        console.log(
+            "❌ Could not return to translations."
+        );
+
+        return;
+    }
+
+    // ========================================================
+    // DOUBLE SAFETY CHECK
+    //
+    // We inspect English one more time before allowing
+    // translations.
+    // ========================================================
+
+    const englishFinal =
+        await inspectEnglishRow(
+            page
+        );
+
+    if (!englishFinal.found) {
+
+        console.log(
+            "🚫 FINAL ENGLISH CHECK FAILED."
+        );
+
+        console.log(
+            "🚫 REFUSING TO CREATE TRANSLATIONS."
+        );
+
+        return;
+    }
+
+    console.log(
+        "✅ FINAL ENGLISH SOURCE CHECK PASSED."
+    );
+
+    // ========================================================
+    // TRANSLATIONS
+    // ========================================================
+
+    const completedLanguages =
+        new Set();
+
+    console.log("");
+    console.log(
+        "================================================"
+    );
+
+    console.log(
+        "STARTING LANGUAGE CHECKS"
+    );
+
+    console.log(
+        "================================================"
+    );
+
+    for (
+        let i = 0;
+        i < LANGUAGES.length;
+        i++
+    ) {
+
+        const language =
+            LANGUAGES[i];
+
+        console.log("");
+        console.log(
+            `LANGUAGE ${i + 1}/${LANGUAGES.length}`
+        );
+
+        try {
+
+            await processLanguage(
+                page,
+                language,
+                completedLanguages
+            );
+
+        } catch (err) {
+
+            console.log("");
+            console.log(
+                `❌ ${language} ERROR`
+            );
+
+            console.log(
+                err.message
+            );
+        }
+
+        await sleep(2500);
+
+        // ----------------------------------------------------
+        // Make sure we're still on this video.
+        // ----------------------------------------------------
+
+        if (
+            !page.url().includes(
+                `/video/${video.id}/`
+            )
+        ) {
+
+            console.log(
+                "⚠️ Wrong video detected."
+            );
+
+            console.log(
+                `Expected: ${video.id}`
+            );
+
+            console.log(
+                `Current: ${page.url()}`
+            );
+
+            console.log(
+                "↩️ Recovering..."
+            );
+
+            const recovered =
+                await navigateTo(
+                    page,
+                    translationsUrl(
+                        video.id
+                    ),
+                    video.id
+                );
+
+            if (!recovered) {
+
+                console.log(
+                    "❌ Could not recover video."
+                );
+
+                break;
+            }
+        }
+
+        // ----------------------------------------------------
+        // Return to translations.
+        // ----------------------------------------------------
+
+        if (
+            !page.url().includes(
+                "/translations"
+            )
+        ) {
+
+            console.log(
+                "↩️ Returning to translations..."
+            );
+
+            const recovered =
+                await navigateTo(
+                    page,
+                    translationsUrl(
+                        video.id
+                    ),
+                    video.id
+                );
+
+            if (!recovered) {
+
+                console.log(
+                    "❌ Could not return to translations."
+                );
+
+                break;
+            }
+
+            await sleep(2500);
+        }
+    }
+
+    console.log("");
+    console.log(
+        "================================================"
+    );
+
+    console.log(
+        `✅ FINISHED VIDEO ${index}/${total}`
+    );
+
+    console.log(
+        `Languages completed/skipped: ${completedLanguages.size}/${LANGUAGES.length}`
+    );
+
+    console.log(
+        "================================================"
+    );
+}
+
+// ============================================================
+// MAIN
+// ============================================================
+
+(async () => {
+
+    let browser = null;
+
+    try {
+
+        const connection =
+            await connect();
+
+        browser =
+            connection.browser;
+
+        const page =
+            connection.page;
+
+        // ----------------------------------------------------
+        // FIND VIDEOS + SHORTS + LIVE
+        // ----------------------------------------------------
+
+        const videos =
+            await findVideos(
+                page
+            );
+
+        if (!videos.length) {
+
+            console.log(
+                "❌ No PUBLIC videos found."
+            );
+
+            return;
+        }
+
+        console.log("");
+        console.log(
+            "================================================"
+        );
+
+        console.log(
+            `🎉 PROCESSING ${videos.length} UNIQUE PUBLIC VIDEOS`
+        );
+
+        console.log(
+            "================================================"
+        );
+
+        // ----------------------------------------------------
+        // PROCESS
+        // ----------------------------------------------------
+
+        for (
+            let i = 0;
+            i < videos.length;
+            i++
+        ) {
+
+            try {
+
+                await processVideo(
+                    page,
+                    videos[i],
+                    i + 1,
+                    videos.length
+                );
+
+            } catch (err) {
+
+                console.log("");
+                console.log(
+                    `❌ VIDEO ${i + 1} ERROR`
+                );
+
+                console.log(
+                    err.message
+                );
+
+                console.log(
+                    "⏭️ Moving to next video."
+                );
+            }
+
+            await sleep(3000);
+        }
+
+        console.log("");
+        console.log(
+            "================================================"
+        );
+
+        console.log(
+            "🎉 ALL PUBLIC VIDEOS COMPLETE"
+        );
+
+        console.log(
+            "================================================"
+        );
+
+    } catch (err) {
+
+        console.log("");
+        console.log(
+            "❌ FATAL ERROR:"
+        );
+
+        console.log(err);
+
+    } finally {
+
+        console.log("");
+        console.log(
+            "Chrome left open."
+        );
+    }
+
+})();
